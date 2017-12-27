@@ -134,13 +134,13 @@ public:
     }
 
     /*!
-     * Get the total estimated print time in seconds
+     * Get the total estimated print time in seconds for each feature
      * 
-     * \return total print time in seconds
+     * \return total print time in seconds for each feature
      */
-    double getTotalPrintTime()
+    std::vector<double> getTotalPrintTimePerFeature()
     {
-        return gcode_writer.getTotalPrintTime();
+        return gcode_writer.getTotalPrintTimePerFeature();
     }
 
     /*!
@@ -150,13 +150,6 @@ public:
     {
         gcode_writer.finalize();
     }
-
-    /*!
-     * Process all files into one meshgroup
-     * 
-     * \warning Unused!
-     */
-    bool processFiles(const std::vector<std::string> &files);
 
     /*!
      * Generate gcode for a given \p meshgroup

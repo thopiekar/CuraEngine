@@ -63,8 +63,34 @@ public:
         return -1;
                 
     }
-    
-    
+
+    /*!
+     * Find whether a point projected on a line segment would be projected to
+     * - properly on the line : zero returned
+     * - closer to \p a : -1 returned
+     * - closer to \p b : 1 returned
+     * 
+     * \param from The point to check in relation to the line segment
+     * \param a The start point of the line segment
+     * \param b The end point of the line segment
+     * \return the sign of the projection wrt the line segment
+     */
+    inline static short pointIsProjectedBeyondLine(const Point from, const Point a, const Point b)
+    {
+        const Point vec = b - a;
+        const Point point_vec = from - a;
+        const int64_t dot_prod = dot(point_vec, vec);
+        if (dot_prod < 0)
+        { // point is projected to before ab
+            return -1;
+        }
+        if (dot_prod > vSize2(vec))
+        { // point is projected to after ab
+            return 1;
+        }
+        return 0;
+    }
+
     /*!
     * Find the point closest to \p from on the line from \p p0 to \p p1
     */
@@ -190,7 +216,23 @@ public:
                 || getDist2FromLineSegment(c, a, d) <= max_dist2
                 || getDist2FromLineSegment(c, b, d) <= max_dist2;
     }
-    
+
+    /*!
+     * Check whether two line segments collide.
+     * 
+     * \warning Edge cases (end points of line segments fall on other line segment) register as a collision.
+     * 
+     * \note All points are assumed to be transformed by the transformation matrix of the vector from \p a_from to \p a_to.
+     * I.e. a is a vertical line; the Y of \p a_from_transformed is the same as the Y of \p a_to_transformed.
+     * 
+     * \param a_from_transformed The transformed from location of line a
+     * \param a_from_transformed The transformed to location of line a
+     * \param b_from_transformed The transformed from location of line b
+     * \param b_from_transformed The transformed to location of line b
+     * \return Whether the two line segments collide
+     */
+    static bool lineSegmentsCollide(Point a_from_transformed, Point a_to_transformed, Point b_from_transformed, Point b_to_transformed);
+
     /*!
      * Compute the angle between two consecutive line segments.
      * 
@@ -209,6 +251,85 @@ public:
      * \return the angle in radians between 0 and 2 * pi of the corner in \p b
      */
     static float getAngleLeft(const Point& a, const Point& b, const Point& c);
+
+    /*!
+     * Returns the determinant of the 2D matrix defined by the the vectors ab and ap as rows.
+     * 
+     * The returned value is zero for \p p lying (approximately) on the line going through \p a and \p b
+     * The value is positive for values lying to the left and negative for values lying to the right when looking from \p a to \p b.
+     * 
+     * \param p the point to check
+     * \param a the from point of the line
+     * \param b the to point of the line
+     * \return a positive value when \p p lies to the left of the line from \p a to \p b
+     */
+    static inline int64_t pointIsLeftOfLine(const Point& p, const Point& a, const Point& b)
+    {
+        return (b.X - a.X) * (p.Y - a.Y) - (b.Y - a.Y) * (p.X - a.X);
+    }
+
+    /*!
+     * Get a point on the line segment (\p a - \p b)with a given distance to point \p p
+     * 
+     * In case there are two possible point that meet the criteria, choose the one closest to a.
+     * 
+     * \param p The reference point
+     * \param a Start of the line segment
+     * \param b End of the line segment
+     * \param dist The required distance of \p result to \p p
+     * \param[out] result The result (if any was found)
+     * \return Whether any such point has been found
+     */
+    static bool getPointOnLineWithDist(const Point p, const Point a, const Point b, int64_t dist, Point& result);
+
+    /*!
+     * Get the squared distance from a point \p p to the line on which \p a and \p b lie
+     */
+    static inline int64_t getDist2FromLine(const Point p, const Point a, const Point b)
+    {
+        //  x.......a------------b
+        //  :
+        //  :
+        //  p
+        // return px_size
+        Point vab = b - a;
+        Point vap = p - a;
+        int64_t dott = dot(vab, vap);
+        int64_t ax_size2 = dott * dott / vSize2(vab);
+        int64_t ap_size2 = vSize2(vap);
+        int64_t px_size2 = std::max(int64_t(0), ap_size2 - ax_size2);
+        return px_size2;
+    }
+    
+    /*!
+     * Check whether a corner is acute or obtuse.
+     * 
+     * This function is irrespective of the order between \p a and \p c;
+     * the lowest angle among bot hsides of the corner is always chosen.
+     * 
+     * isAcuteCorner(a, b, c) === isAcuteCorner(c, b, a)
+     * 
+     * \param a start of first line segment
+     * \param b end of first segment and start of second line segment
+     * \param c end of second line segment
+     * \return positive if acute, negative if obtuse, zero if 90 degree corner
+     */
+    static inline int isAcuteCorner(const Point a, const Point b, const Point c)
+    {
+        Point ba = a - b;
+        Point bc = c - b;
+        return dot(ba, bc);
+    }
+
+    /*!
+     * Get the rotation matrix for rotating around a specific point in place.
+     */
+    static Point3Matrix rotateAround(Point middle, double rotation)
+    {
+        PointMatrix rotation_matrix(rotation);
+        Point3Matrix rotation_matrix_homogeneous(rotation_matrix);
+        return Point3Matrix::translate(middle).compose(rotation_matrix_homogeneous).compose(Point3Matrix::translate(-middle));
+    }
 };
 
 

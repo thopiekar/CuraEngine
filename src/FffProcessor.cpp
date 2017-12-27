@@ -45,29 +45,6 @@ std::string FffProcessor::getAllSettingsString(MeshGroup& meshgroup, bool first_
     return sstream.str();
 }
 
-bool FffProcessor::processFiles(const std::vector< std::string >& files)
-{
-    time_keeper.restart();
-    MeshGroup* meshgroup = new MeshGroup(this);
-    
-    for(std::string filename : files)
-    {
-        log("Loading %s from disk...\n", filename.c_str());
-
-        FMatrix3x3 matrix;
-        if (!loadMeshIntoMeshGroup(meshgroup, filename.c_str(), matrix))
-        {
-            logError("Failed to load model: %s\n", filename.c_str());
-            return false;
-        }
-    }
-    
-    meshgroup->finalize();
-
-    log("Loaded from disk in %5.3fs\n", time_keeper.restart());
-    return processMeshGroup(meshgroup);
-}
-
 bool FffProcessor::processMeshGroup(MeshGroup* meshgroup)
 {
     if (SHOW_ALL_SETTINGS) { logWarning(getAllSettingsString(*meshgroup, meshgroup_number == 0).c_str()); }
@@ -83,7 +60,7 @@ bool FffProcessor::processMeshGroup(MeshGroup* meshgroup)
     bool empty = true;
     for (Mesh& mesh : meshgroup->meshes)
     {
-        if (!mesh.getSettingBoolean("infill_mesh"))
+        if (!mesh.getSettingBoolean("infill_mesh") && !mesh.getSettingBoolean("anti_overhang_mesh"))
         {
             empty = false;
         }
@@ -126,7 +103,7 @@ bool FffProcessor::processMeshGroup(MeshGroup* meshgroup)
     if (CommandSocket::isInstantiated())
     {
         CommandSocket::getInstance()->flushGcode();
-        CommandSocket::getInstance()->sendLayerData();
+        CommandSocket::getInstance()->sendOptimizedLayerData();
     }
     log("Total time elapsed %5.2fs.\n", time_keeper_total.restart());
 

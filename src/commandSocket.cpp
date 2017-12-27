@@ -1,4 +1,8 @@
+//Copyright (c) 2017 Ultimaker B.V.
+//CuraEngine is released under the terms of the AGPLv3 or higher.
+
 #include "utils/logoutput.h"
+#include "utils/macros.h"
 #include "commandSocket.h"
 #include "FffProcessor.h"
 #include "progress/Progress.h"
@@ -18,8 +22,6 @@
 #include <windows.h>
 #endif
 
-#include "settings/SettingRegistry.h" // loadExtruderJSONsettings
-
 #define DEBUG_OUTPUT_OBJECT_STL_THROUGH_CERR(x) 
 
 // std::cerr << x;
@@ -36,7 +38,7 @@ CommandSocket* CommandSocket::instance = nullptr; // instantiate instance
 class Listener : public Arcus::SocketListener
 {
 public:
-    void stateChanged(Arcus::SocketState::SocketState newState) override
+    void stateChanged(Arcus::SocketState::SocketState) override
     {
     }
 
@@ -57,31 +59,48 @@ public:
     }
 };
 
+/*!
+ * A template structure used to store data to be sent to the front end.
+ */
+template <typename T>
+class SliceDataStruct
+{
+    SliceDataStruct(const SliceDataStruct&) = delete;
+    SliceDataStruct& operator=(const SliceDataStruct&) = delete;
+public:
+
+    SliceDataStruct()
+        : sliced_objects(0)
+        , current_layer_count(0)
+        , current_layer_offset(0)
+    { }
+
+    //! The number of sliced objects for this sliced object list
+    int sliced_objects;
+
+    int current_layer_count;//!< Number of layers for which data has been buffered in slice_data so far.
+    int current_layer_offset;//!< Offset to add to layer number for the current slice object when slicing one at a time.
+
+    std::unordered_map<int, std::shared_ptr<T>> slice_data;
+};
+
 class CommandSocket::Private
 {
 public:
     Private()
         : socket(nullptr)
         , object_count(0)
-        , sliced_objects(0)
-        , current_layer_count(0)
-        , current_layer_offset(0)
+        , last_sent_progress(-1)
     { }
 
     std::shared_ptr<cura::proto::Layer> getLayerById(int id);
+
+    std::shared_ptr<cura::proto::LayerOptimized> getOptimizedLayerById(int id);
 
     Arcus::Socket* socket;
     
     // Number of objects that need to be sliced
     int object_count;
-
-    // Number of sliced objects for this sliced object list
-    int sliced_objects;
-
-    // Number of layers sent to the front end so far
-    // Used for incrementing the current layer in one at a time mode
-    int current_layer_count;
-    int current_layer_offset;
 
     std::string temp_gcode_file;
     std::ostringstream gcode_output_stream;
@@ -89,13 +108,153 @@ public:
     // Print object that olds one or more meshes that need to be sliced. 
     std::vector< std::shared_ptr<MeshGroup> > objects_to_slice;
 
-    std::unordered_map<int, std::shared_ptr<cura::proto::Layer>> sliced_layers;
+    SliceDataStruct<cura::proto::Layer> sliced_layers;
+    SliceDataStruct<cura::proto::LayerOptimized> optimized_layers;
+
+    int last_sent_progress; //!< Last sent progress promille (1/1000th). Used to not send duplicate messages with the same promille.
+};
+
+/*!
+ * PathCompiler buffers and prepares the sliced data to be sent to the front end and saves them in
+ * appropriate buffers
+ */
+class CommandSocket::PathCompiler
+{
+    typedef cura::proto::PathSegment::PointType PointType;
+    static_assert(sizeof(PrintFeatureType) == 1, "To be compatible with the Cura frontend code PrintFeatureType needs to be of size 1");
+    //! Reference to the private data of the CommandSocket used to send the data to the front end.
+    CommandSocket::Private& _cs_private_data;
+    //! Keeps track of the current layer number being processed. If layer number is set to a different value, the current data is flushed to CommandSocket.
+    int _layer_nr;
+    int extruder;
+    PointType data_point_type;
+
+    std::vector<PrintFeatureType> line_types; //!< Line types for the line segments stored, the size of this vector is N.
+    std::vector<float> line_widths; //!< Line widths for the line segments stored, the size of this vector is N.
+    std::vector<float> line_thicknesses; //!< Line thicknesses for the line segments stored, the size of this vector is N.
+    std::vector<float> line_feedrates; //!< Line feedrates for the line segments stored, the size of this vector is N.
+    std::vector<float> points; //!< The points used to define the line segments, the size of this vector is D*(N+1) as each line segment is defined from one point to the next. D is the dimensionality of the point.
+
+    Point last_point;
+
+    PathCompiler(const PathCompiler&) = delete;
+    PathCompiler& operator=(const PathCompiler&) = delete;
+public:
+    PathCompiler(CommandSocket::Private& cs_private_data):
+        _cs_private_data(cs_private_data),
+        _layer_nr(0),
+        extruder(0),
+        data_point_type(cura::proto::PathSegment::Point2D),
+        line_types(),
+        line_widths(),
+        line_thicknesses(),
+        line_feedrates(),
+        points(),
+        last_point{0,0}
+    {}
+    ~PathCompiler()
+    {
+        if (line_types.size())
+        {
+            flushPathSegments();
+        }
+    }
+
+    /*!
+     * Used to select which layer the following layer data is intended for.
+     */
+    void setLayer(int new_layer_nr)
+    {
+        if (_layer_nr != new_layer_nr)
+        {
+            flushPathSegments();
+            _layer_nr = new_layer_nr;
+        }
+    }
+    /*!
+     * Returns the current layer which data is written to.
+     */
+    int getLayer() const
+    {
+        return _layer_nr;
+    }
+    /*!
+     * Used to set which extruder will be used for printing the following layer data is intended for.
+     */
+    void setExtruder(int new_extruder)
+    {
+        if (extruder != new_extruder)
+        {
+            flushPathSegments();
+            extruder = new_extruder;
+        }
+    }
+
+    /*!
+     * Special handling of the first point in an added line sequence.
+     * If the new sequence of lines does not start at the current end point
+     * of the path this jump is marked as PrintFeatureType::NoneType
+     */
+    void handleInitialPoint(Point from)
+    {
+        if (points.size() == 0)
+        {
+            addPoint2D(from);
+        }
+        else if (from != last_point)
+        {
+            addLineSegment(PrintFeatureType::NoneType, from, 1.0, 0.0, 0.0);
+        }
+    }
+
+    /*!
+     * Transfers the currently buffered line segments to the
+     * CommandSocket layer message storage.
+     */
+    void flushPathSegments();
+    /*!
+     * Move the current point of this path to \position.
+     */
+    void setCurrentPosition(Point position)
+    {
+        handleInitialPoint(position);
+    }
+    /*!
+     * Adds a single line segment to the current path. The line segment added is from the current last point to point \p to
+     */
+    void sendLineTo(PrintFeatureType print_feature_type, Point to, int width, int thickness, int feedrate);
+    /*!
+     * Adds closed polygon to the current path
+     */
+    void sendPolygon(PrintFeatureType print_feature_type, ConstPolygonRef poly, int width, int thickness, int feedrate);
+private:
+    /*!
+     * Convert and add a point to the points buffer, each point being represented as two consecutive floats. All members adding a 2D point to the data should use this function.
+     */
+    void addPoint2D(Point point)
+    {
+        points.push_back(INT2MM(point.X));
+        points.push_back(INT2MM(point.Y));
+        last_point = point;
+    }
+    /*!
+     * Implements the functionality of adding a single 2D line segment to the path data. All member functions adding a 2D line segment should use this functions.
+     */
+    void addLineSegment(PrintFeatureType print_feature_type, Point point, int line_width, int line_thickness, int line_feedrate)
+    {
+        addPoint2D(point);
+        line_types.push_back(print_feature_type);
+        line_widths.push_back(INT2MM(line_width));
+        line_thicknesses.push_back(INT2MM(line_thickness));
+        line_feedrates.push_back(line_feedrate);
+    }
 };
 #endif
 
 CommandSocket::CommandSocket()
 #ifdef ARCUS
     : private_data(new Private)
+    , path_comp(new PathCompiler(*private_data))
 #endif
 {
 #ifdef ARCUS
@@ -127,12 +286,14 @@ void CommandSocket::connect(const std::string& ip, int port)
     //private_data->socket->registerMessageType(1, &Cura::ObjectList::default_instance());
     private_data->socket->registerMessageType(&cura::proto::Slice::default_instance());
     private_data->socket->registerMessageType(&cura::proto::Layer::default_instance());
+    private_data->socket->registerMessageType(&cura::proto::LayerOptimized::default_instance());
     private_data->socket->registerMessageType(&cura::proto::Progress::default_instance());
     private_data->socket->registerMessageType(&cura::proto::GCodeLayer::default_instance());
-    private_data->socket->registerMessageType(&cura::proto::ObjectPrintTime::default_instance());
+    private_data->socket->registerMessageType(&cura::proto::PrintTimeMaterialEstimates::default_instance());
     private_data->socket->registerMessageType(&cura::proto::SettingList::default_instance());
     private_data->socket->registerMessageType(&cura::proto::GCodePrefix::default_instance());
     private_data->socket->registerMessageType(&cura::proto::SlicingFinished::default_instance());
+    private_data->socket->registerMessageType(&cura::proto::SettingExtruder::default_instance());
 
     private_data->socket->connect(ip, port);
 
@@ -152,44 +313,83 @@ void CommandSocket::connect(const std::string& ip, int port)
     {
         // Actually start handling messages.
         Arcus::MessagePtr message = private_data->socket->takeNextMessage();
+
+        /*
+         * handle a message which consists purely of a SettingList
         cura::proto::SettingList* setting_list = dynamic_cast<cura::proto::SettingList*>(message.get());
         if (setting_list)
         {
             handleSettingList(setting_list);
         }
+        */
 
-        /*cura::proto::ObjectList* object_list = dynamic_cast<cura::proto::ObjectList*>(message.get());
+        /*
+         * handle a message which consists purely of an ObjectList
+        cura::proto::ObjectList* object_list = dynamic_cast<cura::proto::ObjectList*>(message.get());
         if (object_list)
         {
             handleObjectList(object_list);
-        }*/
-        
-        cura::proto::Slice* slice = dynamic_cast<cura::proto::Slice*>(message.get());
+        }
+        */
+
+        // Handle the main Slice message
+        cura::proto::Slice* slice = dynamic_cast<cura::proto::Slice*>(message.get()); // See if the message is of the message type Slice; returns nullptr otherwise
         if (slice)
         {
+            logDebug("Received a Slice message\n");
+            const cura::proto::SettingList& global_settings = slice->global_settings();
+            for (auto setting : global_settings.settings())
+            {
+                FffProcessor::getInstance()->setSetting(setting.name(), setting.value());
+            }
             // Reset object counts
             private_data->object_count = 0;
             for (auto object : slice->object_lists())
             {
-                handleObjectList(&object);
+                handleObjectList(&object, slice->extruders());
             }
+            //For every object, set the extruder fallbacks from the limit_to_extruder.
+            for (const cura::proto::SettingExtruder setting_extruder : slice->limit_to_extruder())
+            {
+                const int32_t extruder_nr = setting_extruder.extruder(); //Implicit cast from Protobuf's int32 to normal int32.
+                for (std::shared_ptr<MeshGroup> meshgroup : private_data->objects_to_slice)
+                {
+                    if (extruder_nr < 0 || extruder_nr >= meshgroup->getExtruderCount()) //We obtained an invalid value from the front-end. Ignore.
+                    { // if extruder_nr == -1 then that means the setting should be handled as if it has no limit_to_extruder, so we can skip it
+                        continue;
+                    }
+                    const ExtruderTrain* settings_base = meshgroup->getExtruderTrain(extruder_nr); //The extruder train that the setting should fall back to.
+                    for (Mesh& mesh : meshgroup->meshes)
+                    {
+                        mesh.setSettingInheritBase(setting_extruder.name(), *settings_base);
+                    }
+                }
+            }
+            logDebug("Done reading Slice message\n");
         }
 
         //If there is an object to slice, do so.
         if (private_data->objects_to_slice.size())
         {
+            int object_count = private_data->objects_to_slice.size();
+            logDebug("Slicing %i objects\n", object_count);
             FffProcessor::getInstance()->resetMeshGroupNumber();
+            int i = 1;
             for (auto object : private_data->objects_to_slice)
             {
+                logDebug("Slicing object %i of %i\n", i, object_count);
                 if (!FffProcessor::getInstance()->processMeshGroup(object.get()))
                 {
                     logError("Slicing mesh group failed!");
                 }
+                i++;
             }
+            logDebug("Done slicing objects\n");
+
             private_data->objects_to_slice.clear();
             FffProcessor::getInstance()->finalize();
             flushGcode();
-            sendPrintTime();
+            sendPrintTimeMaterialEstimates();
             sendFinishedSlicing();
             slice_another_time = false; // TODO: remove this when multiple slicing with CuraEngine is safe
             //TODO: Support all-at-once/one-at-a-time printing
@@ -197,7 +397,7 @@ void CommandSocket::connect(const std::string& ip, int port)
             //private_data->object_to_slice.reset();
             //private_data->processor->resetFileNumber();
 
-            //sendPrintTime();
+            //sendPrintTimeMaterialEstimates();
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -208,7 +408,7 @@ void CommandSocket::connect(const std::string& ip, int port)
 }
 
 #ifdef ARCUS
-void CommandSocket::handleObjectList(cura::proto::ObjectList* list)
+void CommandSocket::handleObjectList(cura::proto::ObjectList* list, const google::protobuf::RepeatedPtrField<cura::proto::Extruder> settings_per_extruder_train)
 {
     if (list->objects_size() <= 0)
     {
@@ -220,18 +420,41 @@ void CommandSocket::handleObjectList(cura::proto::ObjectList* list)
     //private_data->object_ids.clear();
     private_data->objects_to_slice.push_back(std::make_shared<MeshGroup>(FffProcessor::getInstance()));
     MeshGroup* meshgroup = private_data->objects_to_slice.back().get();
-    
+
+    // load meshgroup settings
     for (auto setting : list->settings())
     {
         meshgroup->setSetting(setting.name(), setting.value());
     }
-    
-    for (int extruder_nr = 0; extruder_nr < FffProcessor::getInstance()->getSettingAsCount("machine_extruder_count"); extruder_nr++)
-    { // initialize remaining extruder trains and load the defaults
-        ExtruderTrain* train = meshgroup->createExtruderTrain(extruder_nr); // create new extruder train objects or use already existing ones
-        SettingRegistry::getInstance()->loadExtruderJSONsettings(extruder_nr, train);
+
+    { // load extruder settings
+        int extruder_count = FffProcessor::getInstance()->getSettingAsCount("machine_extruder_count");
+        for (int extruder_nr = 0; extruder_nr < extruder_count; extruder_nr++)
+        { // initialize remaining extruder trains and load the defaults
+            meshgroup->createExtruderTrain(extruder_nr); // create new extruder train objects or use already existing ones
+        }
+
+        bool logged_extra_extruders = false;
+        for (auto extruder : settings_per_extruder_train)
+        {
+            int extruder_nr = extruder.id();
+            if (extruder_nr >= extruder_count)
+            {
+                if (!logged_extra_extruders)
+                {
+                    log("Definition has more extruder trains than extruder count suggests, ignoring extra extruder trains.\n");
+                    logged_extra_extruders = true;
+                }
+                continue;
+            }
+            ExtruderTrain* train = meshgroup->getExtruderTrain(extruder_nr);
+            for (auto setting : extruder.settings().settings())
+            {
+                train->setSetting(setting.name(), setting.value());
+            }
+        }
     }
-    
+
     for (auto object : list->objects())
     {
         int bytes_per_face = BYTES_PER_FLOAT * FLOATS_PER_VECTOR * VECTORS_PER_FACE;
@@ -243,7 +466,9 @@ void CommandSocket::handleObjectList(cura::proto::ObjectList* list)
             continue;
         }
         DEBUG_OUTPUT_OBJECT_STL_THROUGH_CERR("solid Cura_out\n");
-        int extruder_train_nr = 0; // TODO: make primary extruder configurable!
+
+        // Check to which extruder train this object belongs
+        int extruder_train_nr = 0; // assume extruder 0 if setting wasn't supplied
         for (auto setting : object.settings())
         {
             if (setting.name() == "extruder_nr")
@@ -278,6 +503,7 @@ void CommandSocket::handleObjectList(cura::proto::ObjectList* list)
             DEBUG_OUTPUT_OBJECT_STL_THROUGH_CERR("  endfacet\n");
         }
         DEBUG_OUTPUT_OBJECT_STL_THROUGH_CERR("endsolid Cura_out\n");
+
         for (auto setting : object.settings())
         {
             mesh.setSetting(setting.name(), setting.value());
@@ -289,101 +515,204 @@ void CommandSocket::handleObjectList(cura::proto::ObjectList* list)
     private_data->object_count++;
     meshgroup->finalize();
 }
-
-void CommandSocket::handleSettingList(cura::proto::SettingList* list)
-{
-    for (auto setting : list->settings())
-    {
-        FffProcessor::getInstance()->setSetting(setting.name(), setting.value());
-    }
-}
 #endif
 
-void CommandSocket::sendLayerInfo(int layer_nr, int32_t z, int32_t height)
+void CommandSocket::sendOptimizedLayerInfo(int layer_nr, int32_t z, int32_t height)
 {
 #ifdef ARCUS
-    std::shared_ptr<cura::proto::Layer> layer = private_data->getLayerById(layer_nr);
+    std::shared_ptr<cura::proto::LayerOptimized> layer = private_data->getOptimizedLayerById(layer_nr);
     layer->set_height(z);
     layer->set_thickness(height);
 #endif
 }
 
-void CommandSocket::sendPolygons(PrintFeatureType type, int layer_nr, Polygons& polygons, int line_width)
+void CommandSocket::sendPolygons(PrintFeatureType type, const Polygons& polygons, int line_width, int line_thickness, int line_feedrate)
 {
 #ifdef ARCUS
     if (polygons.size() == 0)
-        return;
-
-    std::shared_ptr<cura::proto::Layer> proto_layer = private_data->getLayerById(layer_nr);
-
-    for (unsigned int i = 0; i < polygons.size(); ++i)
     {
-        cura::proto::Polygon* p = proto_layer->add_polygons();
-        p->set_type(static_cast<cura::proto::Polygon_Type>(type));
-        std::string polydata;
-        polydata.append(reinterpret_cast<const char*>(polygons[i].data()), polygons[i].size() * sizeof(Point));
-        p->set_points(polydata);
-        p->set_line_width(line_width);
+        return;
+    }
+
+    if (CommandSocket::isInstantiated())
+    {
+        auto& path_comp = CommandSocket::getInstance()->path_comp;
+
+        for (unsigned int i = 0; i < polygons.size(); ++i)
+        {
+            path_comp->sendPolygon(type, polygons[i], line_width, line_thickness, line_feedrate);
+        }
     }
 #endif
 }
 
+void CommandSocket::sendPolygon(PrintFeatureType type, ConstPolygonRef polygon, int line_width, int line_thickness, int line_feedrate)
+{
+#ifdef ARCUS
+    if (CommandSocket::isInstantiated())
+    {
+        auto& path_comp = CommandSocket::getInstance()->path_comp;
+
+        path_comp->sendPolygon(type, polygon, line_width, line_thickness, line_feedrate);
+    }
+#endif
+}
+
+void CommandSocket::sendLineTo(cura::PrintFeatureType type, Point to, int line_width, int line_thickness, int line_feedrate)
+{
+#ifdef ARCUS
+    if (CommandSocket::isInstantiated())
+    {
+        auto& path_comp = CommandSocket::getInstance()->path_comp;
+
+        path_comp->sendLineTo(type, to, line_width, line_thickness, line_feedrate);
+    }
+#endif
+}
+
+void CommandSocket::setSendCurrentPosition(Point position)
+{
+#ifdef ARCUS
+    if (CommandSocket::isInstantiated())
+    {
+        auto& path_comp = CommandSocket::getInstance()->path_comp;
+        path_comp->setCurrentPosition(position);
+    }
+#endif
+}
+
+void CommandSocket::setLayerForSend(int layer_nr)
+{
+#ifdef ARCUS
+    if (CommandSocket::isInstantiated())
+    {
+        auto& path_comp = CommandSocket::getInstance()->path_comp;
+        path_comp->setLayer(layer_nr);
+    }
+#endif
+}
+
+void CommandSocket::setExtruderForSend(int extruder)
+{
+#ifdef ARCUS
+    if (CommandSocket::isInstantiated())
+    {
+        auto& path_comp = CommandSocket::getInstance()->path_comp;
+        path_comp->setExtruder(extruder);
+    }
+#endif
+}
+
+
 void CommandSocket::sendProgress(float amount)
 {
 #ifdef ARCUS
+    int rounded_amount = 1000 * amount;
+    if (private_data->last_sent_progress == rounded_amount)
+    {
+        return;
+    }
+
     auto message = std::make_shared<cura::proto::Progress>();
     amount /= private_data->object_count;
-    amount += private_data->sliced_objects * (1. / private_data->object_count);
+    amount += private_data->optimized_layers.sliced_objects * (1. / private_data->object_count);
     message->set_amount(amount);
     private_data->socket->sendMessage(message);
+
+    private_data->last_sent_progress = rounded_amount;
 #endif
 }
 
 void CommandSocket::sendProgressStage(Progress::Stage stage)
 {
     // TODO
+    UNUSED_PARAM(stage);
 }
 
-void CommandSocket::sendPrintTime()
+void CommandSocket::sendPrintTimeMaterialEstimates()
 {
 #ifdef ARCUS
-    auto message = std::make_shared<cura::proto::ObjectPrintTime>();
-    message->set_time(FffProcessor::getInstance()->getTotalPrintTime());
-    message->set_material_amount(FffProcessor::getInstance()->getTotalFilamentUsed(0));
+    logDebug("Sending print time and material estimates.\n");
+    auto message = std::make_shared<cura::proto::PrintTimeMaterialEstimates>();
+
+    std::vector<double> time_estimates = FffProcessor::getInstance()->getTotalPrintTimePerFeature();
+    message->set_time_infill(time_estimates[static_cast<unsigned char>(PrintFeatureType::Infill)]);
+    message->set_time_inset_0(time_estimates[static_cast<unsigned char>(PrintFeatureType::OuterWall)]);
+    message->set_time_inset_x(time_estimates[static_cast<unsigned char>(PrintFeatureType::InnerWall)]);
+    message->set_time_none(time_estimates[static_cast<unsigned char>(PrintFeatureType::NoneType)]);
+    message->set_time_retract(time_estimates[static_cast<unsigned char>(PrintFeatureType::MoveRetraction)]);
+    message->set_time_skin(time_estimates[static_cast<unsigned char>(PrintFeatureType::Skin)]);
+    message->set_time_skirt(time_estimates[static_cast<unsigned char>(PrintFeatureType::SkirtBrim)]);
+    message->set_time_support(time_estimates[static_cast<unsigned char>(PrintFeatureType::Support)]);
+    message->set_time_support_infill(time_estimates[static_cast<unsigned char>(PrintFeatureType::SupportInfill)]);
+    message->set_time_support_interface(time_estimates[static_cast<unsigned char>(PrintFeatureType::SupportInterface)]);
+    message->set_time_travel(time_estimates[static_cast<unsigned char>(PrintFeatureType::MoveCombing)]);
+    int num_extruders = FffProcessor::getInstance()->getSettingAsCount("machine_extruder_count");
+    for (int extruder_nr (0); extruder_nr < num_extruders; ++extruder_nr)
+    {
+        cura::proto::MaterialEstimates* material_message = message->add_materialestimates();
+
+        material_message->set_id(extruder_nr);
+        material_message->set_material_amount(FffProcessor::getInstance()->getTotalFilamentUsed(extruder_nr));
+    }
+
     private_data->socket->sendMessage(message);
+    logDebug("Done sending print time and material estimates.\n");
 #endif
 }
 
-void CommandSocket::sendPrintMaterialForObject(int index, int extruder_nr, float print_time)
+void CommandSocket::sendPrintMaterialForObject(int, int, float)
 {
-//     socket.sendInt32(CMD_OBJECT_PRINT_MATERIAL);
-//     socket.sendInt32(12);
-//     socket.sendInt32(index);
-//     socket.sendInt32(extruder_nr);
-//     socket.sendFloat32(print_time);
+    //Do nothing.
 }
 
 void CommandSocket::sendLayerData()
 {
 #ifdef ARCUS
-#endif
-#ifdef ARCUS
-    private_data->sliced_objects++;
-    private_data->current_layer_offset = private_data->current_layer_count;
-    log("End sliced object called. Sending ", private_data->current_layer_count, " layers.");
+    auto& data = private_data->sliced_layers;
 
-    if (private_data->sliced_objects >= private_data->object_count)
+    data.sliced_objects++;
+    data.current_layer_offset = data.current_layer_count;
+//    log("End sliced object called. Sending %d layers.", data.current_layer_count);
+
+    // Only send the data to the front end when all mesh groups have been processed.
+    if (data.sliced_objects >= private_data->object_count)
     {
-        for (std::pair<const int, std::shared_ptr<cura::proto::Layer>> entry : private_data->sliced_layers) //Note: This is in no particular order!
+        for (std::pair<const int, std::shared_ptr<cura::proto::Layer>> entry : data.slice_data) //Note: This is in no particular order!
         {
+            logDebug("Sending layer data for layer %i of %i.\n", entry.first, data.slice_data.size());
             private_data->socket->sendMessage(entry.second); //Send the actual layers.
         }
-        private_data->sliced_objects = 0;
-        private_data->current_layer_count = 0;
-        private_data->current_layer_offset = 0;
-        private_data->sliced_layers.clear();
-        auto done_message = std::make_shared<cura::proto::SlicingFinished>();
-        private_data->socket->sendMessage(done_message);
+        data.sliced_objects = 0;
+        data.current_layer_count = 0;
+        data.current_layer_offset = 0;
+        data.slice_data.clear();
+    }
+#endif
+}
+
+void CommandSocket::sendOptimizedLayerData()
+{
+#ifdef ARCUS
+    path_comp->flushPathSegments(); // make sure the last path segment has been flushed from the compiler
+
+    auto& data = private_data->optimized_layers;
+
+    data.sliced_objects++;
+    data.current_layer_offset = data.current_layer_count;
+    log("End sliced object called. Sending %d layers.", data.current_layer_count);
+
+    if (data.sliced_objects >= private_data->object_count)
+    {
+        for (std::pair<const int, std::shared_ptr<cura::proto::LayerOptimized>> entry : data.slice_data) //Note: This is in no particular order!
+        {
+            logDebug("Sending layer data for layer %i of %i.\n", entry.first, data.slice_data.size());
+            private_data->socket->sendMessage(entry.second); //Send the actual layers.
+        }
+        data.sliced_objects = 0;
+        data.current_layer_count = 0;
+        data.current_layer_offset = 0;
+        data.slice_data.clear();
     }
 #endif
 }
@@ -391,8 +720,10 @@ void CommandSocket::sendLayerData()
 void CommandSocket::sendFinishedSlicing()
 {
 #ifdef ARCUS
+    logDebug("Sending Slicing Finished message.\n");
     std::shared_ptr<cura::proto::SlicingFinished> done_message = std::make_shared<cura::proto::SlicingFinished>();
     private_data->socket->sendMessage(done_message);
+    logDebug("Done sending Slicing Finished message.\n");
 #endif
 }
 
@@ -426,12 +757,12 @@ void CommandSocket::sendGCodePrefix(std::string prefix)
 #ifdef ARCUS
 std::shared_ptr<cura::proto::Layer> CommandSocket::Private::getLayerById(int id)
 {
-    id += current_layer_offset;
+    id += sliced_layers.current_layer_offset;
 
-    auto itr = sliced_layers.find(id);
+    auto itr = sliced_layers.slice_data.find(id);
 
     std::shared_ptr<cura::proto::Layer> layer;
-    if (itr != sliced_layers.end())
+    if (itr != sliced_layers.slice_data.end())
     {
         layer = itr->second;
     }
@@ -439,11 +770,105 @@ std::shared_ptr<cura::proto::Layer> CommandSocket::Private::getLayerById(int id)
     {
         layer = std::make_shared<cura::proto::Layer>();
         layer->set_id(id);
-        current_layer_count++;
-        sliced_layers[id] = layer;
+        sliced_layers.current_layer_count++;
+        sliced_layers.slice_data[id] = layer;
     }
 
     return layer;
+}
+#endif
+
+#ifdef ARCUS
+std::shared_ptr<cura::proto::LayerOptimized> CommandSocket::Private::getOptimizedLayerById(int id)
+{
+    id += optimized_layers.current_layer_offset;
+
+    auto itr = optimized_layers.slice_data.find(id);
+
+    std::shared_ptr<cura::proto::LayerOptimized> layer;
+    if (itr != optimized_layers.slice_data.end())
+    {
+        layer = itr->second;
+    }
+    else
+    {
+        layer = std::make_shared<cura::proto::LayerOptimized>();
+        layer->set_id(id);
+        optimized_layers.current_layer_count++;
+        optimized_layers.slice_data[id] = layer;
+    }
+
+    return layer;
+}
+#endif
+
+#ifdef ARCUS
+void CommandSocket::PathCompiler::flushPathSegments()
+{
+    if (line_types.size() > 0 && CommandSocket::isInstantiated())
+    {
+        std::shared_ptr<cura::proto::LayerOptimized> proto_layer = _cs_private_data.getOptimizedLayerById(_layer_nr);
+
+        cura::proto::PathSegment* p = proto_layer->add_path_segment();
+        p->set_extruder(extruder);
+        p->set_point_type(data_point_type);
+        std::string line_type_data;
+        line_type_data.append(reinterpret_cast<const char*>(line_types.data()), line_types.size()*sizeof(PrintFeatureType));
+        p->set_line_type(line_type_data);
+        std::string polydata;
+        polydata.append(reinterpret_cast<const char*>(points.data()), points.size() * sizeof(float));
+        p->set_points(polydata);
+        std::string line_width_data;
+        line_width_data.append(reinterpret_cast<const char*>(line_widths.data()), line_widths.size()*sizeof(float));
+        p->set_line_width(line_width_data);
+        std::string line_thickness_data;
+        line_thickness_data.append(reinterpret_cast<const char*>(line_thicknesses.data()), line_thicknesses.size()*sizeof(float));
+        p->set_line_thickness(line_thickness_data);
+        std::string line_feedrate_data;
+        line_feedrate_data.append(reinterpret_cast<const char*>(line_feedrates.data()), line_feedrates.size()*sizeof(float));
+        p->set_line_feedrate(line_feedrate_data);
+    }
+    points.clear();
+    line_feedrates.clear();
+    line_thicknesses.clear();
+    line_widths.clear();
+    line_types.clear();
+}
+
+void CommandSocket::PathCompiler::sendLineTo(PrintFeatureType print_feature_type, Point to, int width, int thickness, int feedrate)
+{
+    assert(points.size() > 0 && "A point must already be in the buffer for sendLineTo(.) to function properly");
+
+    if (to != last_point)
+    {
+        addLineSegment(print_feature_type, to, width, thickness, feedrate);
+    }
+}
+
+void CommandSocket::PathCompiler::sendPolygon(PrintFeatureType print_feature_type, ConstPolygonRef polygon, int width, int thickness, int feedrate)
+{
+    if (polygon.size() < 2)
+    {
+        return;
+    }
+
+    auto it = polygon.begin();
+    handleInitialPoint(*it);
+
+    const auto it_end = polygon.end();
+    while (++it != it_end)
+    {
+        // Ignore zero-length segments.
+        if (*it != last_point)
+        {
+            addLineSegment(print_feature_type, *it, width, thickness, feedrate);
+        }
+    }
+    // Make sure the polygon is closed
+    if (*polygon.begin() != polygon.back())
+    {
+        addLineSegment(print_feature_type, *polygon.begin(), width, thickness, feedrate);
+    }
 }
 #endif
 

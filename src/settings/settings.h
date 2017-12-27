@@ -25,14 +25,14 @@ namespace cura
 enum class EGCodeFlavor
 {
 /**
- * RepRap flavored GCode is Marlin/Sprinter/Repetier based GCode.
+ * Marlin flavored GCode is Marlin/Sprinter based GCode.
  *  This is the most commonly used GCode set.
  *  G0 for moves, G1 for extrusion.
  *  E values give mm of filament extrusion.
  *  Retraction is done on E values with G1. Start/end code is added.
  *  M106 Sxxx and M107 are used to turn the fan on/off.
  **/
-    REPRAP = 0,
+    MARLIN = 0,
 /**
  * UltiGCode flavored is Marlin based GCode.
  *  UltiGCode uses less settings on the slicer and puts more settings in the firmware. This makes for more hardware/material independed GCode.
@@ -75,7 +75,7 @@ enum class EGCodeFlavor
  *  Retraction is done with G10 and G11. Retraction settings are ignored. G10 S1 is used for multi-extruder switch retraction.
  *  M106 Sxxx and M107 are used to turn the fan on/off.
  **/
-    REPRAP_VOLUMATRIC = 5,
+    MARLIN_VOLUMATRIC = 5,
 /**
  * Griffin flavored is Marlin based GCode.
  *  This is a type of RepRap used for machines with multiple extruder trains.
@@ -86,6 +86,13 @@ enum class EGCodeFlavor
  *  M227 is used to initialize a single extrusion train.
  **/
     GRIFFIN = 6,
+
+    REPETIER = 7,
+
+/**
+ * Real RepRap GCode suitable for printers using RepRap firmware (e.g. Duet controllers)
+ **/
+    REPRAP = 8,
 };
 
 /*!
@@ -102,20 +109,29 @@ enum class EFillMethod
 {
     LINES,
     GRID,
+    CUBIC,
+    CUBICSUBDIV,
+    TETRAHEDRAL,
+    QUARTER_CUBIC,
     TRIANGLES,
+    TRIHEXAGON,
     CONCENTRIC,
+    CONCENTRIC_3D,
     ZIG_ZAG,
+    CROSS,
+    CROSS_3D,
     NONE
 };
 
 /*!
- * Type of platform adheasion
+ * Type of platform adhesion.
  */
 enum class EPlatformAdhesion
 {
     SKIRT,
     BRIM,
-    RAFT
+    RAFT,
+    NONE
 };
 
 /*!
@@ -132,7 +148,16 @@ enum class EZSeamType
 {
     RANDOM,
     SHORTEST,
-    BACK
+    USER_SPECIFIED,
+    SHARPEST_CORNER
+};
+
+enum class EZSeamCornerPrefType
+{
+    Z_SEAM_CORNER_PREF_NONE,
+    Z_SEAM_CORNER_PREF_INNER,
+    Z_SEAM_CORNER_PREF_OUTER,
+    Z_SEAM_CORNER_PREF_ANY
 };
 
 enum class ESurfaceMode
@@ -142,6 +167,12 @@ enum class ESurfaceMode
     BOTH
 };
 
+enum class FillPerimeterGapMode
+{
+    NOWHERE,
+    EVERYWHERE
+};
+
 enum class CombingMode
 {
     OFF,
@@ -149,10 +180,26 @@ enum class CombingMode
     NO_SKIN
 };
 
+/*!
+ * How the draft shield height is limited.
+ */
+enum class DraftShieldHeightLimitation
+{
+    FULL, //Draft shield takes full height of the print.
+    LIMITED //Draft shield is limited by draft_shield_height setting.
+};
+
 enum class SupportDistPriority
 {
     XY_OVERRIDES_Z,
     Z_OVERRIDES_XY
+};
+
+enum class SlicingTolerance
+{
+    MIDDLE,
+    INCLUSIVE,
+    EXCLUSIVE
 };
 
 #define MAX_EXTRUDERS 16
@@ -172,10 +219,19 @@ class SettingsBaseVirtual
 protected:
     SettingsBaseVirtual* parent;
 public:
-    virtual std::string getSettingString(std::string key) const = 0;
+    virtual const std::string& getSettingString(const std::string& key) const = 0;
     
     virtual void setSetting(std::string key, std::string value) = 0;
-    
+
+    /*!
+     * Set the parent settings base for inheriting a setting to a specific setting base.
+     * This overrides the use of \ref SettingsBaseVirtual::parent.
+     * 
+     * \param key The setting for which to override the inheritance
+     * \param parent The setting base from which to obtain the setting instead.
+     */
+    virtual void setSettingInheritBase(std::string key, const SettingsBaseVirtual& parent) = 0;
+
     virtual ~SettingsBaseVirtual() {}
     
     SettingsBaseVirtual(); //!< SettingsBaseVirtual without a parent settings object
@@ -186,27 +242,51 @@ public:
     
     int getSettingAsIndex(std::string key) const;
     int getSettingAsCount(std::string key) const;
-    
+
+    /*!
+     * Get a setting as an int, but if it's -1 then return
+     * the value of the setting "extruder_nr"
+     */
+    int getSettingAsExtruderNr(std::string key) const;
+
+    /*!
+     * \brief Interprets a setting as a layer number.
+     *
+     * The input of the layer number is one-based. This translates it to
+     * zero-based numbering.
+     *
+     * \return Zero-based numbering of a layer number setting.
+     */
+    unsigned int getSettingAsLayerNumber(std::string key) const;
+
+    double getSettingInAngleDegrees(std::string key) const;
     double getSettingInAngleRadians(std::string key) const;
     double getSettingInMillimeters(std::string key) const;
-    int getSettingInMicrons(std::string key) const;
+    coord_t getSettingInMicrons(std::string key) const;
     bool getSettingBoolean(std::string key) const;
     double getSettingInDegreeCelsius(std::string key) const;
     double getSettingInMillimetersPerSecond(std::string key) const;
     double getSettingInCubicMillimeters(std::string key) const;
     double getSettingInPercentage(std::string key) const;
+    double getSettingAsRatio(std::string key) const; //!< For settings which are provided in percentage
     double getSettingInSeconds(std::string key) const;
-    
+
     FlowTempGraph getSettingAsFlowTempGraph(std::string key) const;
-    
+    FMatrix3x3 getSettingAsPointMatrix(std::string key) const;
+
+    DraftShieldHeightLimitation getSettingAsDraftShieldHeightLimitation(const std::string key) const;
     EGCodeFlavor getSettingAsGCodeFlavor(std::string key) const;
     EFillMethod getSettingAsFillMethod(std::string key) const;
     EPlatformAdhesion getSettingAsPlatformAdhesion(std::string key) const;
     ESupportType getSettingAsSupportType(std::string key) const;
     EZSeamType getSettingAsZSeamType(std::string key) const;
+    EZSeamCornerPrefType getSettingAsZSeamCornerPrefType(std::string key) const;
     ESurfaceMode getSettingAsSurfaceMode(std::string key) const;
-    CombingMode getSettingAsCombingMode(std::string key);
-    SupportDistPriority getSettingAsSupportDistPriority(std::string key);
+    FillPerimeterGapMode getSettingAsFillPerimeterGapMode(std::string key) const;
+    CombingMode getSettingAsCombingMode(std::string key) const;
+    SupportDistPriority getSettingAsSupportDistPriority(std::string key) const;
+    SlicingTolerance getSettingAsSlicingTolerance(std::string key) const;
+    std::vector<int> getSettingAsIntegerList(std::string key) const;
 };
 
 class SettingRegistry;
@@ -222,6 +302,11 @@ class SettingsBase : public SettingsBaseVirtual
     friend class SettingRegistry;
 private:
     std::unordered_map<std::string, std::string> setting_values;
+
+    /*!
+     * Mapping for each setting which must inherit from a different setting base than \ref SettingsBaseVirtual::parent
+     */
+    std::unordered_map<std::string, const SettingsBaseVirtual*> setting_inherit_base;
 public:
     SettingsBase(); //!< SettingsBase without a parent settings object
     SettingsBase(SettingsBaseVirtual* parent); //!< construct a SettingsBase with a parent settings object
@@ -232,7 +317,8 @@ public:
      * \param value the value
      */
     void setSetting(std::string key, std::string value);
-    std::string getSettingString(std::string key) const; //!< Get a setting from this SettingsBase (or any ancestral SettingsBase)
+    void setSettingInheritBase(std::string key, const SettingsBaseVirtual& parent); //!< See \ref SettingsBaseVirtual::setSettingInheritBase
+    const std::string& getSettingString(const std::string& key) const; //!< Get a setting from this SettingsBase (or any ancestral SettingsBase)
     
     std::string getAllLocalSettingsString() const
     {
@@ -272,7 +358,8 @@ public:
     SettingsMessenger(SettingsBaseVirtual* parent); //!< construct a SettingsMessenger with a parent settings object
     
     void setSetting(std::string key, std::string value); //!< Set a setting of the parent SettingsBase to a given value
-    std::string getSettingString(std::string key) const; //!< Get a setting from the parent SettingsBase (or any further ancestral SettingsBase)
+    void setSettingInheritBase(std::string key, const SettingsBaseVirtual& parent); //!< See \ref SettingsBaseVirtual::setSettingInheritBase
+    const std::string& getSettingString(const std::string& key) const; //!< Get a setting from the parent SettingsBase (or any further ancestral SettingsBase)
 };
 
 

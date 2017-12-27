@@ -1,4 +1,4 @@
-/** Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License */
+/** Copyright (C) 2013 Ultimaker - Released under terms of the AGPLv3 License */
 #ifndef MESH_GROUP_H
 #define MESH_GROUP_H
 
@@ -18,9 +18,9 @@ namespace cura
 class MeshGroup : public SettingsBase, NoCopy
 {
     ExtruderTrain* extruders[MAX_EXTRUDERS] = {nullptr};
-    int extruder_count;
+    mutable int extruder_count; //!< The number of extruders. (mutable because of lazy evaluation)
 public:
-    int getExtruderCount();
+    int getExtruderCount() const;
 
     MeshGroup(SettingsBaseVirtual* settings_base);
     

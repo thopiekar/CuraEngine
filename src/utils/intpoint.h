@@ -1,4 +1,4 @@
-/** Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License */
+/** Copyright (C) 2013 Ultimaker - Released under terms of the AGPLv3 License */
 #ifndef INT_POINT_H
 #define INT_POINT_H
 
@@ -21,9 +21,9 @@ Integer points are used to avoid floating point rounding errors, and because Cli
 
 #define INT2MM(n) (double(n) / 1000.0)
 #define INT2MM2(n) (double(n) / 1000000.0)
-#define MM2INT(n) (int64_t((n) * 1000))
-#define MM2_2INT(n) (int64_t((n) * 1000000))
-#define MM3_2INT(n) (int64_t((n) * 1000000000))
+#define MM2INT(n) (int64_t(std::round((n) * 1000)))
+#define MM2_2INT(n) (int64_t(std::round((n) * 1000000)))
+#define MM3_2INT(n) (int64_t(std::round((n) * 1000000000)))
 
 #define INT2MICRON(n) ((n) / 1)
 #define MICRON2INT(n) ((n) * 1)
@@ -136,6 +136,8 @@ inline Point3 operator*(const double d, const Point3& rhs) {
     return rhs * d;
 }
 
+using coord_t = ClipperLib::cInt;
+
 /* 64bit Points are used mostly troughout the code, these are the 2D points from ClipperLib */
 typedef ClipperLib::IntPoint Point;
 
@@ -153,13 +155,15 @@ static Point no_point(std::numeric_limits<int32_t>::infinity(), std::numeric_lim
 INLINE Point operator-(const Point& p0) { return Point(-p0.X, -p0.Y); }
 INLINE Point operator+(const Point& p0, const Point& p1) { return Point(p0.X+p1.X, p0.Y+p1.Y); }
 INLINE Point operator-(const Point& p0, const Point& p1) { return Point(p0.X-p1.X, p0.Y-p1.Y); }
-INLINE Point operator*(const Point& p0, const int32_t i) { return Point(p0.X*i, p0.Y*i); }
-INLINE Point operator*(const int32_t i, const Point& p0) { return p0 * i; }
+template<typename T> INLINE Point operator*(const Point& p0, const T i) { return Point(p0.X * i, p0.Y * i); }
+template<typename T> INLINE Point operator*(const T i, const Point& p0) { return p0 * i; }
 INLINE Point operator/(const Point& p0, const int32_t i) { return Point(p0.X/i, p0.Y/i); }
 INLINE Point operator/(const Point& p0, const Point& p1) { return Point(p0.X/p1.X, p0.Y/p1.Y); }
 
 INLINE Point& operator += (Point& p0, const Point& p1) { p0.X += p1.X; p0.Y += p1.Y; return p0; }
 INLINE Point& operator -= (Point& p0, const Point& p1) { p0.X -= p1.X; p0.Y -= p1.Y; return p0; }
+template<typename T> INLINE Point& operator *= (Point& p0, const T i) { p0.X *= i; p0.Y *= i; return p0; }
+template<typename T> INLINE Point& operator /= (Point& p0, const T i) { p0.X /= i; p0.Y /= i; return p0; }
 
 //INLINE bool operator==(const Point& p0, const Point& p1) { return p0.X==p1.X&&p0.Y==p1.Y; }
 //INLINE bool operator!=(const Point& p0, const Point& p1) { return p0.X!=p1.X||p0.Y!=p1.Y; }
@@ -278,6 +282,83 @@ public:
     Point unapply(const Point p) const
     {
         return Point(p.X * matrix[0] + p.Y * matrix[2], p.X * matrix[1] + p.Y * matrix[3]);
+    }
+};
+
+class Point3Matrix
+{
+public:
+    double matrix[9];
+
+    Point3Matrix()
+    {
+        matrix[0] = 1;
+        matrix[1] = 0;
+        matrix[2] = 0;
+        matrix[3] = 0;
+        matrix[4] = 1;
+        matrix[5] = 0;
+        matrix[6] = 0;
+        matrix[7] = 0;
+        matrix[8] = 1;
+    }
+
+    /*!
+     * Initializes the top left corner with the values of \p b
+     * and the rest as if it's a unit matrix
+     */
+    Point3Matrix(const PointMatrix& b)
+    {
+        matrix[0] = b.matrix[0];
+        matrix[1] = b.matrix[1];
+        matrix[2] = 0;
+        matrix[3] = b.matrix[2];
+        matrix[4] = b.matrix[3];
+        matrix[5] = 0;
+        matrix[6] = 0;
+        matrix[7] = 0;
+        matrix[8] = 1;
+    }
+
+    Point3 apply(const Point3 p) const
+    {
+        return Point3(p.x * matrix[0] + p.y * matrix[1] + p.z * matrix[2]
+                    , p.x * matrix[3] + p.y * matrix[4] + p.z * matrix[5]
+                    , p.x * matrix[6] + p.y * matrix[7] + p.z * matrix[8]);
+    }
+
+    /*!
+     * Apply matrix to vector as homogeneous coordinates.
+     */
+    Point apply(const Point p) const
+    {
+        Point3 result = apply(Point3(p.X, p.Y, 1));
+        return Point(result.x / result.z, result.y / result.z);
+    }
+
+    static Point3Matrix translate(const Point p)
+    {
+        Point3Matrix ret; // uniform matrix
+        ret.matrix[2] = p.X;
+        ret.matrix[5] = p.Y;
+        return ret;
+    }
+
+    Point3Matrix compose(const Point3Matrix& b)
+    {
+        Point3Matrix ret;
+        for (int outx = 0; outx < 3; outx++)
+        {
+            for (int outy = 0; outy < 3; outy++)
+            {
+                ret.matrix[outy * 3 + outx] = 0;
+                for (int in = 0; in < 3; in++)
+                {
+                    ret.matrix[outy * 3 + outx] += matrix[outy * 3 + in] * b.matrix[in * 3 + outx];
+                }
+            }
+        }
+        return ret;
     }
 };
 

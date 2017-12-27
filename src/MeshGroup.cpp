@@ -1,11 +1,17 @@
-/** Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License */
+//Copyright (C) 2013 Ultimaker
+//Copyright (c) 2017 Ultimaker B.V.
+//CuraEngine is released under the terms of the AGPLv3 or higher.
+
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
 
 #include "MeshGroup.h"
+#include "utils/gettime.h"
 #include "utils/logoutput.h"
 #include "utils/string.h"
+
+#include "settings/SettingRegistry.h" // loadExtruderJSONsettings
 
 namespace cura
 {
@@ -44,7 +50,7 @@ MeshGroup::~MeshGroup()
     }
 }
 
-int MeshGroup::getExtruderCount()
+int MeshGroup::getExtruderCount() const
 {
     if (extruder_count == -1)
     {
@@ -54,13 +60,20 @@ int MeshGroup::getExtruderCount()
 }
 
 ExtruderTrain* MeshGroup::createExtruderTrain(unsigned int extruder_nr)
+{
+    assert((int)extruder_nr >= 0 && (int)extruder_nr < getSettingAsCount("machine_extruder_count") && "only valid extruder trains may be requested!");
+    if (!extruders[extruder_nr])
     {
-        if (!extruders[extruder_nr])
+        extruders[extruder_nr] = new ExtruderTrain(this, extruder_nr);
+        int err = SettingRegistry::getInstance()->loadExtruderJSONsettings(extruder_nr, extruders[extruder_nr]);
+        if (err)
         {
-            extruders[extruder_nr] = new ExtruderTrain(this, extruder_nr);
+            logError("Couldn't load extruder.def.json for extruder %i\n", extruder_nr);
+            std::exit(1);
         }
-        return extruders[extruder_nr];
     }
+    return extruders[extruder_nr];
+}
 
 ExtruderTrain* MeshGroup::getExtruderTrain(unsigned int extruder_nr)
 {
@@ -118,6 +131,8 @@ void MeshGroup::clear()
 
 void MeshGroup::finalize()
 {
+    extruder_count = getSettingAsCount("machine_extruder_count");
+
     //If the machine settings have been supplied, offset the given position vertices to the center of vertices (0,0,0) is at the bed center.
     Point3 meshgroup_offset(0, 0, 0);
     if (!getSettingBoolean("machine_center_is_zero"))
@@ -283,6 +298,8 @@ bool loadMeshSTL(Mesh* mesh, const char* filename, const FMatrix3x3& matrix)
 
 bool loadMeshIntoMeshGroup(MeshGroup* meshgroup, const char* filename, const FMatrix3x3& transformation, SettingsBaseVirtual* object_parent_settings)
 {
+    TimeKeeper load_timer;
+
     const char* ext = strrchr(filename, '.');
     if (ext && (strcmp(ext, ".stl") == 0 || strcmp(ext, ".STL") == 0))
     {
@@ -290,6 +307,7 @@ bool loadMeshIntoMeshGroup(MeshGroup* meshgroup, const char* filename, const FMa
         if(loadMeshSTL(&mesh,filename,transformation)) //Load it! If successful...
         {
             meshgroup->meshes.push_back(mesh);
+            log("loading '%s' took %.3f seconds\n",filename,load_timer.restart());
             return true;
         }
     }

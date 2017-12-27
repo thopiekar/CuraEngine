@@ -1,4 +1,4 @@
-/** Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License */
+/** Copyright (C) 2013 Ultimaker - Released under terms of the AGPLv3 License */
 
 #include "layerPart.h"
 #include "settings/settings.h"
@@ -44,12 +44,24 @@ void createLayerWithParts(SliceLayer& storageLayer, SlicerLayer* layer, bool uni
 }
 void createLayerParts(SliceMeshStorage& mesh, Slicer* slicer, bool union_layers, bool union_all_remove_holes)
 {
-    for(unsigned int layer_nr = 0; layer_nr < slicer->layers.size(); layer_nr++)
+    const auto total_layers = slicer->layers.size();
+    assert(mesh.layers.size() == total_layers);
+#pragma omp parallel for default(none) shared(mesh,slicer) firstprivate(union_layers,union_all_remove_holes) schedule(dynamic)
+    for (unsigned int layer_nr = 0; layer_nr < total_layers; layer_nr++)
     {
-        mesh.layers.push_back(SliceLayer());
-        mesh.layers[layer_nr].sliceZ = slicer->layers[layer_nr].z;
-        mesh.layers[layer_nr].printZ = slicer->layers[layer_nr].z;
-        createLayerWithParts(mesh.layers[layer_nr], &slicer->layers[layer_nr], union_layers, union_all_remove_holes);
+        SliceLayer& layer_storage = mesh.layers[layer_nr];
+        SlicerLayer& slice_layer = slicer->layers[layer_nr];
+        createLayerWithParts(layer_storage, &slice_layer, union_layers, union_all_remove_holes);
+    }
+
+    for (unsigned int layer_nr = total_layers - 1; static_cast<int>(layer_nr) != -1; layer_nr--)
+    {
+        SliceLayer& layer_storage = mesh.layers[layer_nr];
+        if (layer_storage.parts.size() > 0 || (mesh.getSettingAsSurfaceMode("magic_mesh_surface_mode") != ESurfaceMode::NORMAL && layer_storage.openPolyLines.size() > 0) )
+        {
+            mesh.layer_nr_max_filled_layer = layer_nr; // last set by the highest non-empty layer
+            break;
+        }
     }
 }
 

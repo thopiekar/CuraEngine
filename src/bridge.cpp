@@ -1,11 +1,11 @@
-/** Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License */
+/** Copyright (C) 2013 Ultimaker - Released under terms of the AGPLv3 License */
 #include "bridge.h"
 
 #include "sliceDataStorage.h"
 
 namespace cura {
 
-int bridgeAngle(Polygons outline, SliceLayer* prevLayer)
+int bridgeAngle(Polygons outline, const SliceLayer* prevLayer)
 {
     AABB boundaryBox(outline);
     //To detect if we have a bridge, first calculate the intersection of the current layer with the previous layer.

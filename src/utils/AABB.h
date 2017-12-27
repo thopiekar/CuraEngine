@@ -18,10 +18,17 @@ public:
     Point min, max;
 
     AABB(); //!< initializes with invalid min and max
-    AABB(Point& min, Point& max); //!< initializes with given min and max
+    AABB(const Point& min, const Point& max); //!< initializes with given min and max
     AABB(const Polygons& polys); //!< Computes the boundary box for the given polygons
+    AABB(ConstPolygonRef poly); //!< Computes the boundary box for the given polygons
 
     void calculate(const Polygons& polys); //!< Calculates the aabb for the given polygons (throws away old min and max data of this aabb)
+    void calculate(ConstPolygonRef poly); //!< Calculates the aabb for the given polygon (throws away old min and max data of this aabb)
+
+    /*!
+     * Get the middle of the bounding box
+     */
+    Point getMiddle() const;
 
     /*!
      * Check whether this aabb overlaps with another.
@@ -48,6 +55,12 @@ public:
      * \param dist The distance by which to expand the borders of the bounding box
      */
     void expand(int dist);
+
+    /*!
+     * Generate a square polygon which coincides with this aabb
+     * \return the polygon of this aabb
+     */
+    Polygon toPolygon() const;
 };
 
 }//namespace cura

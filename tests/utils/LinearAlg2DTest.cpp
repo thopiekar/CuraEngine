@@ -1,9 +1,11 @@
-//Copyright (c) 2015 Ultimaker B.V.
+//Copyright (c) 2017 Ultimaker B.V.
 //CuraEngine is released under the terms of the AGPLv3 or higher.
 
 #include "LinearAlg2DTest.h"
 
 #include <../src/utils/linearAlg2D.h>
+
+#define FUZZ_DISTANCE 2 //Error that is allowed to be introduced by rounding.
 
 namespace cura
 {
@@ -265,6 +267,131 @@ void LinearAlg2DTest::getAngleAssert(Point a, Point b, Point c, float actual_ang
     std::stringstream ss;
     ss << "Corner in " << a << "-" << b << "-" << c << " was computed to have an angle of " << supposed_angle << " instead of " << actual_angle << ".";
     CPPUNIT_ASSERT_MESSAGE(ss.str(), std::fabs(actual_angle - supposed_angle) <= maximum_error_angle);
+}
+
+
+
+void LinearAlg2DTest::pointIsLeftOfLineTest()
+{
+    short actual = 1;
+    Point p(0,10);
+    Point a(10,0);
+    Point b(10,20);
+    // . |
+    int64_t supposed = LinearAlg2D::pointIsLeftOfLine(p, a, b); // . |
+    std::stringstream ss;
+    ss << "Point " << p << " was computed as lying " << ((supposed == 0)? "on" : ((supposed < 0)? "left" : "right")) << " the line from " << a << " to " << b << ", instead of " << ((actual == 0)? "on" : ((actual < 0)? "left" : "right"));
+    CPPUNIT_ASSERT_MESSAGE(ss.str(), actual * supposed > 0 || (actual == 0 && supposed == 0));
+
+}
+
+void LinearAlg2DTest::pointIsLeftOfLineSharpTest()
+{
+    short actual = -1;
+    Point p(3896, 3975);
+    Point a(1599, 3975);
+    Point b(200, 3996);
+    //looks like:         \        .
+    int64_t supposed = LinearAlg2D::pointIsLeftOfLine(p, a, b);
+    std::stringstream ss;
+    ss << "Point " << p << " was computed as lying " << ((supposed == 0)? "on" : ((supposed < 0)? "left" : "right")) << " the line from " << a << " to " << b << ", instead of " << ((actual == 0)? "on" : ((actual < 0)? "left" : "right"));
+    CPPUNIT_ASSERT_MESSAGE(ss.str(), actual * supposed > 0 || (actual == 0 && supposed == 0));
+
+}
+
+
+
+void LinearAlg2DTest::getPointOnLineWithDistTest1()
+{
+    getPointOnLineWithDistAssert(Point(110, 30), Point(0, 0), Point(100, 0), 50, Point(70, 0), true);
+}
+void LinearAlg2DTest::getPointOnLineWithDistTest2()
+{
+    getPointOnLineWithDistAssert(Point(90, 30), Point(0, 0), Point(100, 0), 50, Point(50, 0), true);
+}
+void LinearAlg2DTest::getPointOnLineWithDistTest3()
+{
+    getPointOnLineWithDistAssert(Point(10, 30), Point(0, 0), Point(100, 0), 50, Point(50, 0), true);
+}
+void LinearAlg2DTest::getPointOnLineWithDistTest4()
+{
+    getPointOnLineWithDistAssert(Point(-10, 30), Point(0, 0), Point(100, 0), 50, Point(30, 0), true);
+}
+void LinearAlg2DTest::getPointOnLineWithDistTest5()
+{
+    getPointOnLineWithDistAssert(Point(50, 30), Point(0, 0), Point(100, 0), 50, Point(10, 0), true);
+}
+void LinearAlg2DTest::getPointOnLineWithDistTest6()
+{
+    getPointOnLineWithDistAssert(Point(210, 30), Point(0, 0), Point(100, 0), 50, Point(70, 0), false);
+}
+void LinearAlg2DTest::getPointOnLineWithDistTest7()
+{
+    getPointOnLineWithDistAssert(Point(110, 130), Point(0, 0), Point(100, 0), 50, Point(70, 0), false);
+}
+
+
+void LinearAlg2DTest::getPointOnLineWithDistAssert(const Point p, const Point a, const Point b, int64_t dist, Point actual_result, bool actual_returned)
+{
+    Point supposed_result;
+    bool supposed_returned = LinearAlg2D::getPointOnLineWithDist(p, a, b, dist, supposed_result);
+
+    int64_t returned_dist = vSize(supposed_result - p);
+
+    std::stringstream ss;
+    if (actual_returned)
+    {
+        if (supposed_returned)
+        {
+            ss << "Point " << p << " was projected on (" << a << "-" << b << ") to " << supposed_result << " instead of " << actual_result << ".";
+        }
+        else
+        {
+            ss << "Point " << p << " wasn't projected on (" << a << "-" << b << ") instead of projecting to " << actual_result << ".";
+        }
+    }
+    else
+    {
+        if (supposed_returned)
+        {
+            ss << "Point " << p << " was projected on (" << a << "-" << b << ") to " << supposed_result << ", but it wasn't supposed to project.";
+        }
+        else
+        {
+            ss << "This is no error! This should never show!";
+        }
+    }
+    ss << " \t Requested dist was " << dist << " result dist is " << returned_dist << ".";
+    CPPUNIT_ASSERT_MESSAGE(ss.str(), (!actual_returned && !supposed_returned) || (actual_returned && vSize2(actual_result - supposed_result) < 10 * 10 && std::abs(returned_dist - dist) < 10));
+}
+
+void LinearAlg2DTest::rotateAround90()
+{
+    rotateAroundAssert(Point(25, 30), Point(10, 17), 90, Point(-3, 32));
+}
+
+void LinearAlg2DTest::rotateAroundNegative90()
+{
+    rotateAroundAssert(Point(25, 30), Point(10, 17), -90, Point(23, 2));
+}
+
+void LinearAlg2DTest::rotateAround0()
+{
+    rotateAroundAssert(Point(-67, 14), Point(50, 50), 0, Point(-67, 14));
+}
+
+void LinearAlg2DTest::rotateAround12()
+{
+    rotateAroundAssert(Point(-67, 14), Point(50, 50), 12, Point(-57, -9)); //Actually [-57, -9.5]!
+}
+
+void LinearAlg2DTest::rotateAroundAssert(const Point point, const Point origin, const double angle, const Point expected_result)
+{
+    Point3Matrix mat = LinearAlg2D::rotateAround(origin, angle);
+    Point result = mat.apply(point);
+    std::stringstream ss;
+    ss << "LinearAlg2D::rotateAround failed: Rotating " << point << " around " << origin << " for " << angle << " degrees resulted in " << result << " instead of expected " << expected_result << ".";
+    CPPUNIT_ASSERT_MESSAGE(ss.str(), vSize(result - expected_result) < FUZZ_DISTANCE);
 }
 
 }
